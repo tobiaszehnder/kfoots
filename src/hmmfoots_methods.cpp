@@ -1,6 +1,7 @@
 #include <Rcpp.h>
 #include "core.cpp"
 #include "schedule.cpp"
+#include "logarithmetic.hpp"
 
 template <typename T>
 static inline bool allequal(const T& a, const T& b) {return a==b;}
@@ -48,7 +49,7 @@ inline int fb_iter(Mat<double> eprobs, Mat<double> posteriors,
                     Vec<double> initP, Vec<double> new_initP, 
                     Mat<double> trans, Mat<double> new_trans, long double& llik,
                     FBtmp& storage){
-    int nobs = eprobs.ncol;
+    int nobs    = eprobs.ncol;
     int nstates = eprobs.nrow;
     if (nobs != posteriors.ncol || 
         !allequal(nstates, posteriors.nrow, initP.len, new_initP.len, 
@@ -60,42 +61,42 @@ inline int fb_iter(Mat<double> eprobs, Mat<double> posteriors,
     /* FORWARD LOOP */
     /* first iteration is from fictitious start state */
     {
-        double cf = 0;//scaling factor
+        double cf = -std::numeric_limits<double>::infinity();//scaling factor
         double* emissprob = eprobs.colptr(0);
-        double* forward = posteriors.colptr(0);
+        double* forward   = posteriors.colptr(0);
         for (int r = 0; r < nstates; ++r){
-            double p = emissprob[r]*initP[r];
+	    double p = emissprob[r] + log(initP[r]);
             forward[r] = p;
-            cf += p;
+            cf = logadd(cf, p);
         }
-        if (cf==0) return 0;  //underflow error
+        if (cf==-std::numeric_limits<double>::infinity()) return 0;  //underflow error
         for (int r = 0; r < nstates; ++r){
-            forward[r] = forward[r]/cf;
+            forward[r] = forward[r] - cf;
         }
-        llik += log(cf);
+        llik += cf;
     }
     /* all other iterations */
     for (int i = 0 + 1; i < nobs; ++i){
-        double cf = 0;//scaling factor
-        double* emissprob = eprobs.colptr(i);
-        double* forward = posteriors.colptr(i);
+        double cf = -std::numeric_limits<double>::infinity();//scaling factor
+        double*    emissprob = eprobs.colptr(i);
+        double*      forward = posteriors.colptr(i);
         double* last_forward = posteriors.colptr(i-1);
     
         for (int t = 0; t < nstates; ++t){
             double* transcol = trans.colptr(t);
-            double acc = 0;
+            double acc = -std::numeric_limits<double>::infinity();
             for (int s = 0; s < nstates; ++s){
-                acc += last_forward[s]*transcol[s];
+	        acc = logadd(acc, last_forward[s] + log(transcol[s]));
             }
-            acc *= emissprob[t];
+            acc += emissprob[t];
             forward[t] = acc;
-            cf += acc;
+            cf = logadd(cf, acc);
         }
-        if (cf==0) return i; //underflow error
+        if (cf==-std::numeric_limits<double>::infinity()) return i; //underflow error
         for (int t = 0; t < nstates; ++t){
-            forward[t] = forward[t]/cf;
+            forward[t] = forward[t] - cf;
         }
-        llik += log(cf);
+        llik += cf;
     }
     
     /* BACKWARD LOOP */
@@ -104,47 +105,54 @@ inline int fb_iter(Mat<double> eprobs, Mat<double> posteriors,
     /* first iteration set backward to 1/k, 
      * last column of posteriors is already ok */
     
-    Vec<double> backward = storage.backward;
+    Vec<double>     backward = storage.backward;
     Vec<double> new_backward = storage.new_backward;
-    Mat<double> tmp = storage.tmp;
+    Mat<double>          tmp = storage.tmp;
     
     for (int r = 0; r < nstates; ++r){
-        backward[r] = 1.0/nstates;
+        backward[r] = log(1.0/nstates);
     }
     for (int i = nobs-2; i >= 0; --i){
         double* emissprob = eprobs.colptr(i+1);
         double* posterior = posteriors.colptr(i);
-        double cf = 0;
-        double norm = 0;
+        double cf   = -std::numeric_limits<double>::infinity();
+        double norm = -std::numeric_limits<double>::infinity();
         /* joint probabilities and backward vector */
         for (int s = 0; s < nstates; ++s){
             //the forward variable is going to be overwritten with the posteriors
-            double pc = posterior[s];
-            double acc = 0;
+	    double pc  = posterior[s];
+            double acc = -std::numeric_limits<double>::infinity();
             
             for (int t = 0; t < nstates; ++t){
-                double p = trans(s, t)*emissprob[t]*backward[t];
-                tmp(s, t) = pc*p;
-                acc += p;
+	        double p = log(trans(s, t)) + emissprob[t] + backward[t];
+                tmp(s, t) = pc + p;
+                acc = logadd(acc, p);
             }
             
             new_backward[s] = acc;
-            cf += acc;
+            cf = logadd(cf, acc);
         }
-        if (cf==0) return i; //underflow error
+        if (cf==-std::numeric_limits<double>::infinity()) return i; //underflow error
         /* update backward vector */
         for (int s = 0; s < nstates; ++s){
-            backward[s] = new_backward[s]/cf;
-            norm += backward[s]*posterior[s];
+            backward[s] = new_backward[s] - cf;
+            norm = logadd(norm, backward[s] + posterior[s]);
         }
         /* update transition probabilities */
         for (int t = 0, e = nstates*nstates; t < e; ++t){
-            new_trans[t] += tmp[t]/(norm*cf);
+	    new_trans[t] = new_trans[t] + exp(tmp[t] - (norm+cf));
         }
         /* get posteriors */
         for (int s = 0; s < nstates; ++s){
-            posterior[s] = posterior[s]*backward[s]/norm;
+	    posterior[s] = posterior[s] + backward[s]-norm;
         }
+    }
+    /* exponentiate posterior */
+    for (int i = 0; i < nobs; ++i){
+        double* posterior = posteriors.colptr(i);
+        for (int s = 0; s < nstates; ++s){
+	    posterior[s] = exp(posterior[s]);
+	}
     }
     /* set new_initP */
     double* posterior = posteriors.colptr(0);
@@ -197,27 +205,7 @@ static inline double fb_core(Mat<double> initPs, Mat<double> trans, Mat<double> 
         FBtmp thread_tmp(nrow);
         int retcode = FB_OK; //return code from fb_iter
         int uflowchunk = -1; //chunk that caused the underflow
-               
-        /* transform the log likelihoods to probabilities (exponentiate). 
-         * A column-specific factor is multiplied to obtain a better numerical
-         * stability. This tends to be the bottle-neck of the whole
-         * algorithm, but it is indispensable, and it scales well with the
-         * number of cores.*/
-        #pragma omp for schedule(static) reduction(+:tot_llik)
-        for (int c = 0; c < ncol; ++c){
-            double* llikcol = lliks.colptr(c);
-            /* get maximum llik in the column */
-            double max_llik = llikcol[0];
-            for (int r = 1; r < nrow; ++r){
-                if (llikcol[r] > max_llik){ max_llik = llikcol[r]; }
-            }
-            /* subtract maximum and exponentiate */
-            tot_llik += max_llik;
-            for (int r = 0; r < nrow; ++r, ++llikcol){
-                *llikcol = exp(*llikcol - max_llik);
-            }
-        }
-        
+
         /* Do forward and backward loop for each chunk (defined by seqlens)
          * Chunks might have very different lengths (that's why they have been scheduled). */
         #pragma omp for schedule(static) nowait
